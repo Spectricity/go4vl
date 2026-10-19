@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	sys "syscall"
+	"time"
 
 	"github.com/vladimirvivien/go4vl/v4l2"
 )
@@ -22,6 +23,19 @@ type Device struct {
 	requestedBuf v4l2.RequestBuffers
 	streaming    bool
 	output       chan []byte
+	frames       chan Frame
+	numPlanes    uint32
+}
+
+// Frame is a captured frame with the metadata of the buffer it came in.
+type Frame struct {
+	Data []byte
+	// Sequence is the driver's frame counter; gaps mean dropped frames.
+	Sequence uint32
+	// Timestamp is the buffer's capture time on the clock the driver uses
+	// (CLOCK_MONOTONIC for most drivers, see Flags & v4l2.BufFlagTimestampMask).
+	Timestamp time.Duration
+	Flags     uint32
 }
 
 // Open creates opens the underlying device at specified path for streaming.
@@ -185,6 +199,21 @@ func (d *Device) MemIOType() v4l2.IOType {
 
 // GetOutput returns the channel that outputs streamed data that is
 // captured from the underlying device driver.
+// GetFrames returns the channel of captured frames with their metadata, when
+// the device was opened with WithFrames().
+func (d *Device) GetFrames() <-chan Frame {
+	return d.frames
+}
+
+// PlaneCount returns the number of memory planes per buffer of the
+// multi-planar format (1 for single-planar devices).
+func (d *Device) PlaneCount() uint32 {
+	if d.numPlanes == 0 {
+		return 1
+	}
+	return d.numPlanes
+}
+
 func (d *Device) GetOutput() <-chan []byte {
 	return d.output
 }
@@ -392,6 +421,15 @@ func (d *Device) Start(ctx context.Context) error {
 		return fmt.Errorf("device: stream already started")
 	}
 
+	// the plane count is needed to exchange multi-planar buffers with the driver
+	if d.bufType == v4l2.BufTypeVideoCaptureMPlane || d.bufType == v4l2.BufTypeVideoOutputMPlane {
+		pixFmtMp, err := v4l2.GetPixFormatMPlane(d.fd, d.bufType)
+		if err != nil {
+			return fmt.Errorf("device: start stream: %w", err)
+		}
+		d.numPlanes = uint32(pixFmtMp.NumPlanes)
+	}
+
 	// allocate device buffers
 	bufReq, err := v4l2.InitBuffers(d)
 	if err != nil {
@@ -434,6 +472,9 @@ func (d *Device) Stop() error {
 // capture events.
 func (d *Device) startStreamLoop(ctx context.Context) error {
 	d.output = make(chan []byte, d.config.bufSize)
+	if d.config.frames {
+		d.frames = make(chan Frame, d.config.bufSize)
+	}
 
 	// Initial enqueue of buffers for capture
 	for i := 0; i < int(d.config.bufSize); i++ {
@@ -449,6 +490,9 @@ func (d *Device) startStreamLoop(ctx context.Context) error {
 
 	go func() {
 		defer close(d.output)
+		if d.frames != nil {
+			defer close(d.frames)
+		}
 
 		var frame []byte
 		waitForRead := v4l2.WaitForRead(d)
@@ -466,17 +510,24 @@ func (d *Device) startStreamLoop(ctx context.Context) error {
 
 				bytesused := buff.BytesUsed
 				if buff.Type == v4l2.BufTypeVideoCaptureMPlane || buff.Type == v4l2.BufTypeVideoOutputMPlane {
-					bytesused = buff.Info.Planes[buff.Index].BytesUsed
+					bytesused = buff.Info.Planes[0].BytesUsed
 				}
 
 				// copy mapped buffer (copying avoids polluted data from subsequent dequeue ops)
-				if buff.Flags&v4l2.BufFlagMapped != 0 && buff.Flags&v4l2.BufFlagError == 0 {
+				frame = nil
+				if buff.Flags&v4l2.BufFlagMapped != 0 && buff.Flags&v4l2.BufFlagError == 0 && bytesused > 0 {
 					frame = make([]byte, bytesused)
-					if n := copy(frame, d.buffers[buff.Index][:bytesused]); n == 0 {
-						d.output <- []byte{}
+					copy(frame, d.buffers[buff.Index][:bytesused])
+				}
+				if d.frames != nil {
+					d.frames <- Frame{
+						Data:      frame,
+						Sequence:  buff.Sequence,
+						Timestamp: time.Duration(buff.Timestamp.Nano()),
+						Flags:     buff.Flags,
 					}
+				} else if frame != nil {
 					d.output <- frame
-					frame = nil
 				} else {
 					d.output <- []byte{}
 				}

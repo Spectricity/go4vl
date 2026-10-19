@@ -12,6 +12,7 @@ type config struct {
 	bufSize         uint32
 	fps             uint32
 	bufType         uint32
+	frames          bool
 }
 
 type Option func(*config)
@@ -43,6 +44,15 @@ func WithPixFormatMPlane(pixFmtMp v4l2.PixFormatMPlane) Option {
 func WithBufferSize(size uint32) Option {
 	return func(o *config) {
 		o.bufSize = size
+	}
+}
+
+// WithFrames makes a capture device deliver Frame values, with the buffer's
+// sequence number and timestamp, on GetFrames() instead of raw bytes on
+// GetOutput().
+func WithFrames() Option {
+	return func(o *config) {
+		o.frames = true
 	}
 }
 
