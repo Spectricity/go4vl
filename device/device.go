@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"sync"
 	sys "syscall"
 	"time"
 
@@ -25,6 +26,8 @@ type Device struct {
 	output       chan []byte
 	frames       chan Frame
 	numPlanes    uint32
+	// mapped frames handed out and not released yet (WithMappedFrames)
+	outstanding sync.WaitGroup
 }
 
 // Frame is a captured frame with the metadata of the buffer it came in.
@@ -36,6 +39,18 @@ type Frame struct {
 	// (CLOCK_MONOTONIC for most drivers, see Flags & v4l2.BufFlagTimestampMask).
 	Timestamp time.Duration
 	Flags     uint32
+
+	release func()
+}
+
+// Release gives a frame's buffer back to the driver. Frames of a device
+// opened with WithMappedFrames must be released; for other frames it does
+// nothing. Calling it more than once has no effect.
+func (f *Frame) Release() {
+	if f.release != nil {
+		f.release()
+		f.release = nil
+	}
 }
 
 // Open creates opens the underlying device at specified path for streaming.
@@ -513,9 +528,32 @@ func (d *Device) startStreamLoop(ctx context.Context) error {
 					bytesused = buff.Info.Planes[0].BytesUsed
 				}
 
+				valid := buff.Flags&v4l2.BufFlagMapped != 0 && buff.Flags&v4l2.BufFlagError == 0 && bytesused > 0
+
+				// mapped frames: the receiver releases the buffer
+				if d.config.mappedFrames && valid {
+					index := buff.Index
+					var once sync.Once
+					d.outstanding.Add(1)
+					d.frames <- Frame{
+						Data:      d.buffers[index][:bytesused],
+						Sequence:  buff.Sequence,
+						Timestamp: time.Duration(buff.Timestamp.Nano()),
+						Flags:     buff.Flags,
+						release: func() {
+							once.Do(func() {
+								// fails only once streaming stopped
+								_, _ = v4l2.QueueBuffer(d, index, 0)
+								d.outstanding.Done()
+							})
+						},
+					}
+					continue
+				}
+
 				// copy mapped buffer (copying avoids polluted data from subsequent dequeue ops)
 				frame = nil
-				if buff.Flags&v4l2.BufFlagMapped != 0 && buff.Flags&v4l2.BufFlagError == 0 && bytesused > 0 {
+				if valid {
 					frame = make([]byte, bytesused)
 					copy(frame, d.buffers[buff.Index][:bytesused])
 				}
@@ -536,6 +574,20 @@ func (d *Device) startStreamLoop(ctx context.Context) error {
 					panic(fmt.Sprintf("device: stream loop queue: %s: buff: %#v", err, buff))
 				}
 			case <-ctx.Done():
+				if d.config.mappedFrames {
+					// the buffers are unmapped at stop: release the frames
+					// nobody received, wait for the ones being used
+				drain:
+					for {
+						select {
+						case f := <-d.frames:
+							f.Release()
+						default:
+							break drain
+						}
+					}
+					d.outstanding.Wait()
+				}
 				d.Stop()
 				return
 			}

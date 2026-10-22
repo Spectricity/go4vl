@@ -13,6 +13,7 @@ type config struct {
 	fps             uint32
 	bufType         uint32
 	frames          bool
+	mappedFrames    bool
 }
 
 type Option func(*config)
@@ -53,6 +54,19 @@ func WithBufferSize(size uint32) Option {
 func WithFrames() Option {
 	return func(o *config) {
 		o.frames = true
+	}
+}
+
+// WithMappedFrames makes a capture device deliver Frame values (as
+// WithFrames) whose Data is the driver's mapped buffer itself, not a copy:
+// no allocation and no copy per frame. The buffer goes back to the driver
+// when the receiver calls Frame.Release, which it must do for every frame,
+// as soon as it is done with Data (the driver can only fill the buffers it
+// has back). Data must not be used after Release.
+func WithMappedFrames() Option {
+	return func(o *config) {
+		o.frames = true
+		o.mappedFrames = true
 	}
 }
 
